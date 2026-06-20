@@ -1,0 +1,1290 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "yfinance>=0.2.40",
+#     "akshare>=1.12.0",
+#     "pandas>=2.0.0",
+#     "mplfinance>=0.12.0",
+#     "rich>=13.0.0",
+#     "matplotlib>=3.7.0",
+#     "requests>=2.31.0",
+# ]
+# ///
+"""
+China Stock Market Pro — 中国市场一站式股票分析工具
+
+多数据源架构 (模仿 stock-analysis 的多源+缓存模式):
+  美股/Crypto: Yahoo Finance → Stooq → 直接 HTTP
+  A股:         Sina 新浪 → Tencent 腾讯 → baostock → AKShare
+  港股:        Yahoo → Sina HK → Tencent HK
+
+磁盘缓存:
+  报价: 5min TTL | 基本面: 1h TTL | K线: 15min TTL | 市场环境: 15min TTL
+  存储: ~/.clawdbot/skills/cn-stock-pro/cache/
+
+Usage:
+    uv run --script scripts/cnstock price TICKER
+    uv run --script scripts/cnstock chart TICKER [PERIOD] [candle|line]
+    uv run --script scripts/cnstock compare TICKER1 TICKER2 [...] [--period PERIOD]
+    uv run --script scripts/cnstock fundamentals TICKER
+    uv run --script scripts/cnstock earnings TICKER
+    uv run --script scripts/cnstock history TICKER
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import pandas as pd
+
+# ──────────────────────────────────────────────────────────────────
+# 磁盘缓存层
+# ──────────────────────────────────────────────────────────────────
+
+def _cache_dir() -> Path:
+    """缓存目录：与 portfolio 共用一个父目录"""
+    state = os.environ.get("CLAWDBOT_STATE_DIR", os.path.expanduser("~/.clawdbot"))
+    d = Path(state) / "skills" / "cn-stock-pro" / "cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _cache_key(ticker: str, data_type: str) -> str:
+    """缓存文件名：TICKER_type.json，共享指标用 _ 前缀"""
+    return f"{ticker}_{data_type}.json"
+
+
+def _cache_get(ticker: str, data_type: str, ttl_seconds: int) -> dict | None:
+    """
+    从磁盘缓存读数据。
+    ttl_seconds: 数据有效期（秒）。超过此时间返回 None。
+    """
+    path = _cache_dir() / _cache_key(ticker, data_type)
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            entry = json.load(f)
+        age = time.time() - entry.get("cached_at", 0)
+        if age < ttl_seconds:
+            return entry["data"]
+    except (json.JSONDecodeError, KeyError):
+        pass
+    # 过期或损坏，删除
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return None
+
+
+def _cache_set(ticker: str, data_type: str, data: dict):
+    """写入磁盘缓存，自动带时间戳"""
+    path = _cache_dir() / _cache_key(ticker, data_type)
+    entry = {"cached_at": time.time(), "data": data}
+    with open(path, "w") as f:
+        json.dump(entry, f, ensure_ascii=False)
+
+
+# ──────────────────────────────────────────────────────────────────
+# 内存缓存层（单次运行内复用，学 stock-analysis 的 _cache 模式）
+# ──────────────────────────────────────────────────────────────────
+
+_mem_cache: dict[str, dict] = {}  # key → {expires_at, data}
+_mem_ttl: dict[str, int] = {}     # key → ttl_seconds
+
+
+def _mem_get(key: str) -> dict | None:
+    """内存缓存：同一次运行内，相同 key 不重复请求"""
+    if key in _mem_cache and time.time() < _mem_cache[key]["expires_at"]:
+        return _mem_cache[key]["data"]
+    return None
+
+
+def _mem_set(key: str, data: dict, ttl: int):
+    """写入内存缓存"""
+    _mem_cache[key] = {"expires_at": time.time() + ttl, "data": data}
+    _mem_ttl[key] = ttl
+
+
+def cached(ticker: str, data_type: str, ttl_seconds: int):
+    """
+    统一缓存入口：先查内存 → 再查磁盘 → fetch_func 执行 → 写入两层缓存
+    用法: @cached("AAPL", "quote", 300)
+
+    这与 stock-analysis 的 _get_cached/_set_cache 模式相同，
+    但增加了磁盘持久化层。
+    """
+    def decorator(fetch_func):
+        def wrapper():
+            # 1. 内存缓存（最快）
+            mem_key = f"{ticker}|{data_type}"
+            result = _mem_get(mem_key)
+            if result is not None:
+                return result
+
+            # 2. 磁盘缓存
+            result = _cache_get(ticker, data_type, ttl_seconds)
+            if result is not None:
+                _mem_set(mem_key, result, ttl_seconds)
+                return result
+
+            # 3. 实际请求
+            result = fetch_func()
+            if result:
+                _mem_set(mem_key, result, ttl_seconds)
+                _cache_set(ticker, data_type, result)
+            return result
+        return wrapper
+    return decorator
+
+
+# ──────────────────────────────────────────────────────────────────
+# 多源数据获取：美股/Crypto
+# ──────────────────────────────────────────────────────────────────
+
+def _fetch_yahoo_info(ticker: str) -> dict | None:
+    """Yahoo Finance — 首选数据源，带限流重试"""
+    import yfinance as yf
+    for attempt in range(4):
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            if info and ("regularMarketPrice" in info or "currentPrice" in info):
+                info["_source"] = "yahoo"
+                return dict(info)
+            time.sleep(0.5)
+        except Exception as e:
+            msg = str(e).lower()
+            if any(kw in msg for kw in ("rate", "429", "too many")):
+                wait = min(2 ** (attempt + 1), 30)
+                print(f"   ⏳ Yahoo 限流，等待 {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            if attempt < 3:
+                time.sleep(1)
+    return None
+
+
+def _fetch_stooq_info(ticker: str) -> dict | None:
+    """
+    Stooq — 免费全球数据源，无需 API Key
+    波兰金融数据服务商，覆盖美股/港股/外汇
+    """
+    import requests
+    try:
+        # Stooq API: https://stooq.com/q/l/?s=aapl&f=sd2t2ohlcv&h&e=json
+        symbol = ticker.lower()
+        url = f"https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=json"
+        resp = requests.get(url, timeout=10, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+        })
+        data = resp.json()
+        if "symbols" in data and data["symbols"]:
+            item = data["symbols"][0]
+            if item.get("close"):
+                return {
+                    "shortName": item.get("name", ticker),
+                    "regularMarketPrice": item.get("close"),
+                    "regularMarketOpen": item.get("open"),
+                    "regularMarketDayHigh": item.get("high"),
+                    "regularMarketDayLow": item.get("low"),
+                    "regularMarketPreviousClose": item.get("previousclose"),
+                    "regularMarketChangePercent": item.get("changepercent"),
+                    "regularMarketVolume": item.get("volume"),
+                    "_source": "stooq",
+                }
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_yahoo_direct(ticker: str) -> dict | None:
+    """
+    直接 HTTP 调 Yahoo Finance chart API（有时比 yfinance 库的限流更宽松）
+    """
+    import requests
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2d"
+        resp = requests.get(url, timeout=10, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        })
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return None
+        meta = result[0].get("meta", {})
+        quote = result[0].get("indicators", {}).get("quote", [{}])[0]
+        if meta.get("regularMarketPrice"):
+            return {
+                "shortName": meta.get("symbol", ticker),
+                "regularMarketPrice": meta.get("regularMarketPrice"),
+                "regularMarketPreviousClose": meta.get("previousClose"),
+                "regularMarketDayHigh": meta.get("regularMarketDayHigh"),
+                "regularMarketDayLow": meta.get("regularMarketDayLow"),
+                "regularMarketVolume": quote.get("volume", [None])[-1],
+                "_source": "yahoo-direct",
+            }
+    except Exception:
+        pass
+    return None
+
+
+def get_us_info(ticker: str) -> dict:
+    """
+    美股多源获取: Yahoo → Stooq → Yahoo直连
+    结果被磁盘缓存 5 分钟 (报价) / 1 小时 (基本面)
+    """
+    sources = [
+        ("Yahoo Finance", _fetch_yahoo_info),
+        ("Stooq", _fetch_stooq_info),
+        ("Yahoo (direct)", _fetch_yahoo_direct),
+    ]
+    for name, fetcher in sources:
+        result = fetcher(ticker)
+        if result:
+            return result
+    return {}
+
+
+# ──────────────────────────────────────────────────────────────────
+# 多源数据获取：A股
+# ──────────────────────────────────────────────────────────────────
+
+def _fetch_sina_info(code: str) -> dict | None:
+    """
+    新浪财经 API — 20年老接口，中国散户最常用的实时行情源
+    格式: var hq_str_sh600519="名称,今开,昨收,现价,最高,最低,..."
+    URL:  https://hq.sinajs.cn/list=sh600519
+    """
+    import requests
+    import re
+
+    market = "sh" if code.startswith("6") else "sz"
+    symbol = f"{market}{code}"
+
+    try:
+        url = f"https://hq.sinajs.cn/list={symbol}"
+        resp = requests.get(url, timeout=8, headers={
+            "Referer": "https://finance.sina.com.cn",
+            "User-Agent": "Mozilla/5.0",
+        })
+        resp.encoding = "gbk"
+        text = resp.text
+        if not text or "FAILED" in text:
+            return None
+
+        # 解析 var hq_str_sh600519="..."
+        match = re.search(r'"([^"]*)"', text)
+        if not match:
+            return None
+
+        fields = match.group(1).split(",")
+        if len(fields) < 32:
+            return None
+
+        # 新浪字段顺序（经典 30+ 字段）
+        name = fields[0]
+        open_price = _safe_float(fields[1])
+        prev_close = _safe_float(fields[2])
+        price = _safe_float(fields[3])
+        high = _safe_float(fields[4])
+        low = _safe_float(fields[5])
+        volume = _safe_float(fields[8])  # 成交量（手）
+        volume = volume * 100 if volume else None  # 手 → 股
+
+        if not price:
+            return None
+
+        change = price - prev_close if price and prev_close else None
+        change_pct = (change / prev_close * 100) if change and prev_close else None
+
+        return {
+            "symbol": code,
+            "shortName": name,
+            "regularMarketPrice": price,
+            "regularMarketOpen": open_price,
+            "regularMarketDayHigh": high,
+            "regularMarketDayLow": low,
+            "regularMarketPreviousClose": prev_close,
+            "regularMarketChange": change,
+            "regularMarketChangePercent": change_pct,
+            "regularMarketVolume": volume,
+            "_source": "sina",
+        }
+    except Exception:
+        return None
+
+
+def _fetch_tencent_info(code: str) -> dict | None:
+    """
+    腾讯财经 API — 和 Sina 一样稳定，返回格式略规范
+    URL: https://qt.gtimg.cn/q=sh600519
+    """
+    import requests
+    import re
+
+    market = "sh" if code.startswith("6") else "sz"
+    symbol = f"{market}{code}"
+
+    try:
+        url = f"https://qt.gtimg.cn/q={symbol}"
+        resp = requests.get(url, timeout=8, headers={
+            "User-Agent": "Mozilla/5.0",
+        })
+        resp.encoding = "gbk"
+        text = resp.text
+        if not text or "none" in text.lower():
+            return None
+
+        match = re.search(r'"([^"]*)"', text)
+        if not match:
+            return None
+
+        fields = match.group(1).split("~")
+        if len(fields) < 50:
+            return None
+
+        # 腾讯字段: 1=名称, 3=现价, 4=昨收, 5=今开, 6=成交量(手), 33=最高, 34=最低
+        name = fields[1]
+        price = _safe_float(fields[3])
+        prev_close = _safe_float(fields[4])
+        open_price = _safe_float(fields[5])
+        volume = _safe_float(fields[6])
+        volume = volume * 100 if volume else None
+        high = _safe_float(fields[33])
+        low = _safe_float(fields[34])
+        change_pct = _safe_float(fields[32])  # 涨跌幅
+
+        if not price:
+            return None
+
+        change_val = price - prev_close if price and prev_close else None
+
+        return {
+            "symbol": code,
+            "shortName": name,
+            "regularMarketPrice": price,
+            "regularMarketOpen": open_price,
+            "regularMarketDayHigh": high,
+            "regularMarketDayLow": low,
+            "regularMarketPreviousClose": prev_close,
+            "regularMarketChange": change_val,
+            "regularMarketChangePercent": change_pct,
+            "regularMarketVolume": volume,
+            "_source": "tencent",
+        }
+    except Exception:
+        return None
+
+
+def _fetch_akshare_info(code: str) -> dict | None:
+    """AKShare — 最后后备，因为可能被代理拦截"""
+    import akshare as ak
+    try:
+        df = ak.stock_zh_a_spot_em()
+        row = df[df["代码"] == code]
+        if row.empty:
+            return None
+        row = row.iloc[0]
+        price = float(row["最新价"]) if pd.notna(row.get("最新价")) else None
+        prev = float(row["昨收"]) if pd.notna(row.get("昨收")) else None
+        return {
+            "symbol": code,
+            "shortName": row.get("名称", code),
+            "regularMarketPrice": price,
+            "regularMarketOpen": _safe_float_val(row.get("今开")),
+            "regularMarketDayHigh": _safe_float_val(row.get("最高")),
+            "regularMarketDayLow": _safe_float_val(row.get("最低")),
+            "regularMarketPreviousClose": prev,
+            "regularMarketChangePercent": _safe_float_val(row.get("涨跌幅")),
+            "regularMarketVolume": _safe_float_val(row.get("成交量")),
+            "_source": "akshare",
+        }
+    except Exception:
+        return None
+
+
+def _fetch_baostock_info(code: str) -> dict | None:
+    """
+    baostock — 纯 Python 证券数据，免费，无需 token
+    适合历史数据和基本面，实时行情较慢
+    """
+    try:
+        import baostock as bs
+        import re
+
+        # baostock 的代码格式：sh.600519 或 sz.000858
+        if code.startswith("6"):
+            symbol = f"sh.{code}"
+        else:
+            symbol = f"sz.{code}"
+
+        lg = bs.login()
+        if lg.error_code != "0":
+            return None
+
+        try:
+            rs = bs.query_stock_basic(code=symbol)
+            basic = rs.get_data() if rs.error_code == "0" else pd.DataFrame()
+
+            # 获取当天K线
+            today = datetime.now().strftime("%Y-%m-%d")
+            week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+            rs2 = bs.query_history_k_data_plus(
+                symbol, "date,open,high,low,close,preclose,volume",
+                start_date=week_ago, end_date=today,
+                frequency="d", adjustflag="2"
+            )
+            df = rs2.get_data() if rs2.error_code == "0" else pd.DataFrame()
+
+            if df.empty:
+                return None
+
+            last = df.iloc[-1]
+            price = _safe_float_val(last["close"])
+            if not price or price <= 0:
+                return None
+
+            name = code
+            if not basic.empty:
+                name = basic.iloc[0].get("code_name", code)
+
+            return {
+                "symbol": code,
+                "shortName": name,
+                "regularMarketPrice": price,
+                "regularMarketOpen": _safe_float_val(last["open"]),
+                "regularMarketDayHigh": _safe_float_val(last["high"]),
+                "regularMarketDayLow": _safe_float_val(last["low"]),
+                "regularMarketPreviousClose": _safe_float_val(last["preclose"]),
+                "regularMarketVolume": _safe_float_val(last["volume"]),
+                "_source": "baostock",
+            }
+        finally:
+            bs.logout()
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_cn_finance_info(code: str) -> dict | None:
+    """
+    A股基本面数据 — 从腾讯接口获取 PE/PB/市值
+    腾讯的 qt.gtimg.cn 返回 ~70 个字段，比新浪的 30+ 字段更全
+    """
+    import requests
+    import re
+
+    market = "sh" if code.startswith("6") else "sz"
+    symbol = f"{market}{code}"
+
+    try:
+        url = f"https://qt.gtimg.cn/q={symbol}"
+        resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        resp.encoding = "gbk"
+        text = resp.text
+        if not text:
+            return None
+
+        match = re.search(r'"([^"]*)"', text)
+        if not match:
+            return None
+
+        fields = match.group(1).split("~")
+        if len(fields) < 50:
+            return None
+
+        # 腾讯字段映射（实测 sh600519 验证）:
+        # [1]=名称 [3]=现价 [4]=昨收 [31]=涨跌额 [32]=涨跌幅%
+        # [33]=最高 [34]=最低 [39]=市盈率 [44]=总市值(亿) [46]=市净率
+        # [47]=52周最高 [48]=52周最低 [65]=ROE(%) 疑似
+        pe = _safe_float(fields[39]) if len(fields) > 39 else None
+        market_cap_yi = _safe_float(fields[44]) if len(fields) > 44 else None  # 总市值（亿元）
+        pb = _safe_float(fields[46]) if len(fields) > 46 else None
+        roe_raw = _safe_float(fields[65]) if len(fields) > 65 else None  # 可能是 ROE
+        w52_high = _safe_float(fields[47]) if len(fields) > 47 else None
+        w52_low = _safe_float(fields[48]) if len(fields) > 48 else None
+
+        # 市值单位是亿，转成元
+        market_cap = market_cap_yi * 1e8 if market_cap_yi else None
+
+        # EPS 反算: PE = Price / EPS → EPS = Price / PE
+        eps = None
+        price_from_tencent = _safe_float(fields[3]) if len(fields) > 3 else None
+        if pe and pe > 0 and price_from_tencent:
+            eps = price_from_tencent / pe
+
+        result = {}
+        if pe and pe > 0:
+            result["trailingPE"] = pe
+        if pb and pb > 0:
+            result["priceToBook"] = pb
+        if market_cap and market_cap > 0:
+            result["marketCap"] = market_cap
+        if eps and eps > 0:
+            result["trailingEps"] = eps
+        if roe_raw and 0 < roe_raw < 100:
+            result["returnOnEquity"] = roe_raw / 100  # 转为小数
+        if w52_high:
+            result["fiftyTwoWeekHigh"] = w52_high
+        if w52_low:
+            result["fiftyTwoWeekLow"] = w52_low
+
+        return result if result else None
+    except Exception:
+        return None
+
+
+def get_cn_info(code: str) -> dict:
+    """
+    A股多源获取: Sina → Tencent → baostock → AKShare
+    结果是报价数据，缓存 5 分钟
+    """
+    sources = [
+        ("Sina", _fetch_sina_info),
+        ("Tencent", _fetch_tencent_info),
+        ("baostock", _fetch_baostock_info),
+        ("AKShare", _fetch_akshare_info),
+    ]
+    for name, fetcher in sources:
+        try:
+            result = fetcher(code)
+            if result:
+                return result
+        except Exception:
+            continue
+    return {"error": "所有 A 股数据源均不可用", "symbol": code}
+
+
+# ──────────────────────────────────────────────────────────────────
+# 工具函数
+# ──────────────────────────────────────────────────────────────────
+
+def _safe_float(val) -> float | None:
+    """安全转换数字，处理 NaN"""
+    try:
+        if val is None:
+            return None
+        if isinstance(val, (int, float)):
+            return float(val) if pd.notna(val) else None
+        if isinstance(val, str):
+            val = val.replace(",", "").replace("%", "").strip()
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_float_val(val) -> float | None:
+    """处理来自 DataFrame 的值"""
+    try:
+        if val is None:
+            return None
+        if hasattr(val, 'iloc'):
+            return float(val) if pd.notna(val) else None
+        return float(val) if pd.notna(pd.NA if val is pd.NA else val) else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _open_file(path: str):
+    """跨平台打开文件（macOS/Linux/Windows）"""
+    import subprocess, platform
+    try:
+        system = platform.system()
+        if system == "Darwin":
+            subprocess.run(["open", path], check=False)
+        elif system == "Linux":
+            subprocess.run(["xdg-open", path], check=False)
+        elif system == "Windows":
+            os.startfile(path)
+        print(f"   🖼️  已自动打开图片")
+    except Exception:
+        pass  # 打开失败不影响主流程
+
+
+def detect_market(code: str) -> str:
+    """自动识别市场: sh/sz/hk/us/crypto"""
+    code = code.upper().strip()
+    if code.endswith(".HK"):
+        return "hk"
+    if "-" in code:
+        return "crypto"
+    if code.isdigit() and len(code) == 6:
+        if code.startswith("6"):
+            return "sh"
+        if code.startswith(("0", "3")):
+            return "sz"
+        return "sh"
+    if code.replace(".", "").isalpha():
+        return "us"
+    return "us"
+
+
+def to_yahoo_ticker(code: str) -> str:
+    market = detect_market(code)
+    if market == "sh":
+        return f"{code}.SS"
+    if market == "sz":
+        return f"{code}.SZ"
+    if market == "hk" and not code.endswith(".HK"):
+        return f"{code}.HK"
+    return code
+
+
+# ──────────────────────────────────────────────────────────────────
+# 统一数据入口（带缓存）
+# ──────────────────────────────────────────────────────────────────
+
+def get_info_quote(ticker: str) -> dict:
+    """获取报价（5分钟缓存）"""
+    market = detect_market(ticker)
+
+    # 先查内存缓存（同一次运行）
+    cached = _mem_get(f"{ticker}|quote")
+    if cached:
+        cached["_from_cache"] = True
+        return cached
+
+    # 再查磁盘缓存（跨运行）
+    cached = _cache_get(ticker, "quote", 300)
+    if cached:
+        cached["_from_cache"] = True
+        _mem_set(f"{ticker}|quote", cached, 300)
+        return cached
+
+    if market in ("sh", "sz"):
+        info = get_cn_info(ticker)
+    else:
+        yahoo_code = to_yahoo_ticker(ticker) if market == "hk" else ticker
+        info = get_us_info(yahoo_code)
+
+    if info:
+        info["_from_cache"] = False
+        _mem_set(f"{ticker}|quote", info, 300)
+        _cache_set(ticker, "quote", info)
+    return info
+
+
+def get_info_fundamentals(ticker: str) -> dict:
+    """获取基本面（1小时缓存，PE/ROE不会每分钟变）"""
+    cached = _cache_get(ticker, "fundamentals", 3600)
+    if cached:
+        return cached
+
+    market = detect_market(ticker)
+
+    if market in ("sh", "sz"):
+        info = get_cn_info(ticker)
+        # A股额外获取财务指标：先用腾讯接口，再用 AKShare
+        fin = _fetch_cn_finance_info(ticker)
+        if fin:
+            info = info or {}
+            for k in ("trailingPE", "priceToBook", "marketCap", "trailingEps"):
+                if k in fin and k not in info:
+                    info[k] = fin[k]
+        else:
+            # 腾讯接口没数据，试 AKShare
+            try:
+                import akshare as ak
+                akshare_code = f"sh{ticker}" if ticker.startswith("6") else f"sz{ticker}"
+                df = ak.stock_individual_basic_info_xq(symbol=akshare_code)
+                if not df.empty:
+                    for _, r in df.iterrows():
+                        key = str(r["item"]).strip()
+                        val = r["value"]
+                        if "市盈率" in key and "动态" in key and "trailingPE" not in (info or {}):
+                            info = info or {}
+                            info["trailingPE"] = _safe_float_val(val)
+                        elif "市净率" in key and "priceToBook" not in (info or {}):
+                            info = info or {}
+                            info["priceToBook"] = _safe_float_val(val)
+                        elif "总市值" in key and "marketCap" not in (info or {}):
+                            info = info or {}
+                            if isinstance(val, str):
+                                val = val.replace(",", "")
+                                if "万亿" in val:
+                                    info["marketCap"] = float(val.replace("万亿", "")) * 1e12
+                                elif "亿" in val:
+                                    info["marketCap"] = float(val.replace("亿", "")) * 1e8
+            except Exception:
+                pass
+    else:
+        yahoo_code = to_yahoo_ticker(ticker) if market == "hk" else ticker
+        info = get_us_info(yahoo_code)
+
+    if info:
+        _cache_set(ticker, "fundamentals", info)
+    return info or {}
+
+
+# ──────────────────────────────────────────────────────────────────
+# 子命令
+# ──────────────────────────────────────────────────────────────────
+
+def cmd_price(ticker: str):
+    """实时报价"""
+    info = get_info_quote(ticker)
+
+    if not info or "error" in info:
+        err = info.get("error", "数据为空") if info else "数据为空"
+        print(f"❌ 无法获取 {ticker} 的数据: {err}")
+        return
+
+    name = info.get("shortName") or info.get("longName") or ticker
+    price = info.get("regularMarketPrice") or info.get("currentPrice", "N/A")
+    prev_close = info.get("regularMarketPreviousClose") or info.get("previousClose")
+    change = info.get("regularMarketChange")
+    change_pct = info.get("regularMarketChangePercent")
+    high = info.get("regularMarketDayHigh") or info.get("dayHigh")
+    low = info.get("regularMarketDayLow") or info.get("dayLow")
+    volume = info.get("regularMarketVolume") or info.get("volume")
+    source = info.get("_source", "unknown")
+    from_cache = info.get("_from_cache", False)
+    cache_hint = " ⚡缓存" if from_cache else ""
+
+    # 计算涨跌
+    if change is None and prev_close and price and price != "N/A":
+        change = price - prev_close
+    if change_pct is None and change is not None and prev_close:
+        change_pct = (change / prev_close) * 100
+
+    direction = "📈" if (change or 0) > 0 else "📉" if (change or 0) < 0 else "➡️"
+
+    source_names = {
+        "yahoo": "Yahoo Finance", "yahoo-direct": "Yahoo (直连)",
+        "stooq": "Stooq", "sina": "新浪财经", "tencent": "腾讯财经",
+        "baostock": "baostock", "akshare": "AKShare",
+    }
+
+    print(f"\n{direction} {name} ({ticker})")
+    print(f"   数据源: {source_names.get(source, source)}{cache_hint}")
+    print(f"   当前价: {price}")
+    if change is not None:
+        print(f"   涨跌额: {change:+.2f}")
+    if change_pct is not None:
+        print(f"   涨跌幅: {change_pct:+.2f}%")
+    print(f"   今开:   {info.get('regularMarketOpen', 'N/A')}")
+    print(f"   最高:   {high}")
+    print(f"   最低:   {low}")
+    if prev_close:
+        print(f"   昨收:   {prev_close}")
+    if volume:
+        vol_str = f"{volume:,.0f}" if isinstance(volume, (int, float)) else str(volume)
+        print(f"   成交量: {vol_str}")
+    print()
+
+
+def _resolve_period(period: str) -> tuple[str, str]:
+    """
+    中文化周期映射：30d→近30天, 90d→近3个月, 6mo→近半年, 1y→近1年, 5y→近5年, max→全部
+    返回 (yfinance_period, display_name_cn, display_name_en)
+    """
+    mapping = {
+        "30d": ("1mo", "近 30 天", "30 Days"),
+        "90d": ("3mo", "近 3 个月", "3 Months"),
+        "6mo": ("6mo", "近半年", "6 Months"),
+        "1y":  ("1y", "近 1 年", "1 Year"),
+        "5y":  ("5y", "近 5 年", "5 Years"),
+        "max": ("max", "全部历史", "All Time"),
+        # 兼容旧格式
+        "1mo": ("1mo", "近 30 天", "30 Days"),
+        "3mo": ("3mo", "近 3 个月", "3 Months"),
+    }
+    if period in mapping:
+        return mapping[period]
+    return (period, period, period)
+
+
+def cmd_chart(ticker: str, period: str = "6mo", style: str = "candle"):
+    """生成专业图表，完成后自动打开"""
+    from rich.console import Console
+    console = Console()
+
+    yf_period, display_name, display_name_en = _resolve_period(period)
+    style_label_cn = "蜡烛图" if style == "candle" else "折线图"
+
+    with console.status(f"[bold green]正在生成 {ticker} {display_name} {style_label_cn}..."):
+        # 获取历史数据（15min-1h 缓存取决于周期）
+        ttl = 900 if yf_period in ("1mo", "3mo") else 3600
+        cached = _cache_get(ticker, f"history_{yf_period}", ttl)
+        if cached:
+            df = pd.DataFrame(cached["ohlcv"])
+            if "Date" in df.columns:
+                df["Date"] = pd.to_datetime(df["Date"])
+                df = df.set_index("Date")
+        else:
+            df = _fetch_history(ticker, yf_period)
+            if df is not None and not df.empty:
+                ohlcv = df.reset_index().to_dict(orient="list")
+                if "Date" in ohlcv:
+                    ohlcv["Date"] = [str(d) for d in ohlcv["Date"]]
+                _cache_set(ticker, f"history_{yf_period}", {"ohlcv": ohlcv})
+
+        if df is None or df.empty:
+            print(f"❌ 无法获取 {ticker} 的历史数据")
+            return
+
+        required_cols = {"Open", "High", "Low", "Close", "Volume"}
+        if not required_cols.issubset(df.columns):
+            print(f"❌ 数据格式不正确")
+            return
+
+        # 计算均线
+        df["MA5"] = df["Close"].rolling(window=5).mean()
+        df["MA20"] = df["Close"].rolling(window=20).mean()
+        df["MA60"] = df["Close"].rolling(window=60).mean()
+
+        import mplfinance as mpf
+        import matplotlib as mpl
+        mpl.rcParams["font.sans-serif"] = ["STHeiti", "PingFang HK", "Arial Unicode MS", "DejaVu Sans"]
+        mpl.rcParams["axes.unicode_minus"] = False
+
+        save_path = f"/tmp/{ticker}_{yf_period}_{style}.png"
+        # 标题用英文避免中文字体缺失 → tofu 字符
+        chart_title = f"{ticker} — {display_name_en}"
+        mpf.plot(
+            df,
+            type="candle" if style == "candle" else "line",
+            volume=True,
+            title=chart_title,
+            ylabel="Price",
+            ylabel_lower="Volume",
+            savefig=save_path,
+            figsize=(14, 8),
+            style="charles",
+            mav=(5, 20, 60) if style == "candle" else (),
+            datetime_format="%m/%d",
+        )
+        size_kb = os.path.getsize(save_path) / 1024
+        print(f"\n✅ {ticker} {display_name} {style_label_cn} 已生成")
+        print(f"   📁 {save_path} ({size_kb:.0f} KB)")
+
+    # 自动打开图片
+    _open_file(save_path)
+
+
+def cmd_compare(tickers: list[str], period: str = "6mo"):
+    """
+    Generate a normalized multi-stock comparison chart.
+
+    Fetches historical Close prices for each ticker, normalizes to
+    percentage change from start date ((close/close[0] - 1) * 100),
+    and plots all series on a single matplotlib line chart.
+    """
+    from rich.console import Console
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    console = Console()
+    yf_period, display_name, display_name_en = _resolve_period(period)
+
+    # ── Tableau 10 color palette ──
+    COLORS = [
+        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+        '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+    ]
+
+    # ── Fetch + normalize ──
+    all_close: dict[str, pd.Series] = {}
+    failed: list[str] = []
+    with console.status(f"[bold green]正在获取 {len(tickers)} 只股票 {display_name} 数据..."):
+        for ticker in tickers:
+            try:
+                # 小幅延迟避免触发反爬
+                if ticker != tickers[0]:
+                    time.sleep(0.3)
+                df = _fetch_history(ticker, yf_period)
+                if df is None or df.empty or "Close" not in df.columns:
+                    failed.append(ticker)
+                    continue
+                close = df["Close"].dropna()
+                if len(close) < 5:
+                    failed.append(ticker)
+                    continue
+                # Normalize to percentage change from first close
+                base = close.iloc[0]
+                if base <= 0:
+                    failed.append(ticker)
+                    continue
+                all_close[ticker] = (close / base - 1) * 100
+            except Exception:
+                failed.append(ticker)
+
+    # ── All failed ──
+    if not all_close:
+        print(f"❌ 所有 {len(tickers)} 只股票数据获取失败，请检查代码或网络。")
+        if failed:
+            print(f"   失败列表: {', '.join(failed)}")
+        return
+
+    # ── Plot ──
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    for i, (ticker, series) in enumerate(all_close.items()):
+        color = COLORS[i % len(COLORS)]
+        label = ticker  # 只用代码，避免 CJK 字体缺失 → 豆腐块
+        ax.plot(series.index, series.values, color=color, linewidth=1.8, label=label)
+
+    ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.8, alpha=0.7)
+    ax.set_ylabel('Change (%)', fontsize=12)
+    ax.set_title(f"Normalized Performance — {display_name_en}", fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+    fig.autofmt_xdate()
+
+    # ── Save ──
+    tickers_abbrev = '_'.join(t.replace('.', '-') for t in tickers)
+    if len(tickers_abbrev) > 80:
+        tickers_abbrev = tickers_abbrev[:77] + f'_plus{len(tickers) - 3}'
+    save_path = f"/tmp/compare_{tickers_abbrev}_{yf_period}.png"
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    size_kb = os.path.getsize(save_path) / 1024
+
+    count_ok = len(all_close)
+    print(f"\n✅ 对比图已生成: {count_ok}/{len(tickers)} 只股票")
+    if failed:
+        print(f"   ⚠️ 数据获取失败 ({len(failed)} 只): {', '.join(failed)}")
+    if count_ok == 1:
+        print(f"   💡 仅有 1 只股票数据可用，生成为单一走势线。")
+    print(f"   📁 {save_path} ({size_kb:.0f} KB)")
+
+    _open_file(save_path)
+
+
+def _fetch_history(ticker: str, period: str) -> pd.DataFrame | None:
+    """多源获取历史K线"""
+    import yfinance as yf
+
+    market = detect_market(ticker)
+    period_map = {"1mo": "1mo", "3mo": "3mo", "6mo": "6mo", "1y": "1y", "5y": "5y", "max": "max"}
+
+    # 美股/Crypto 用 Yahoo
+    if market not in ("sh", "sz"):
+        yahoo_code = to_yahoo_ticker(ticker) if market == "hk" else ticker
+        for attempt in range(3):
+            try:
+                stock = yf.Ticker(yahoo_code)
+                df = stock.history(period=period_map.get(period, period))
+                if not df.empty:
+                    return df
+            except Exception:
+                time.sleep(1 * (attempt + 1))
+        return None
+
+    # A股: Sina → AKShare
+    import requests
+
+    market_code = "sh" if ticker.startswith("6") else "sz"
+
+    # 周期 → 取行数
+    tail_map = {"1mo": 22, "3mo": 66, "6mo": 132, "1y": 252, "5y": 1260, "max": 9999}
+    tail_n = tail_map.get(period, 66)
+
+    # Sina K线
+    try:
+        url = f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={market_code}{ticker}&scale=240&ma=no&datalen=1023"
+        resp = requests.get(url, timeout=10, headers={"Referer": "https://finance.sina.com.cn"})
+        data = resp.json()
+        if data:
+            df = pd.DataFrame(data)
+            df = df.rename(columns={"day": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+            df["Date"] = pd.to_datetime(df["Date"])
+            for col in ["Open", "High", "Low", "Close", "Volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.set_index("Date")
+            df = df[["Open", "High", "Low", "Close", "Volume"]]
+            return df.tail(tail_n)
+    except Exception:
+        pass
+
+    # fallback: AKShare
+    try:
+        import akshare as ak
+        df = ak.stock_zh_a_hist(symbol=ticker, period="daily", adjust="qfq")
+        if df is not None and not df.empty:
+            df = df.rename(columns={"日期": "Date", "开盘": "Open", "收盘": "Close", "最高": "High", "最低": "Low", "成交量": "Volume"})
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.set_index("Date")[["Open", "High", "Low", "Close", "Volume"]]
+            return df.tail(tail_n)
+    except Exception:
+        pass
+
+    return None
+
+
+def cmd_fundamentals(ticker: str):
+    """基本面分析（带新手解释）"""
+    # 先看缓存
+    info = get_info_fundamentals(ticker)
+
+    if not info or "error" in info:
+        err = info.get("error", "") if info else ""
+        # 无缓存 → 强制获取
+        info = get_info_quote(ticker)
+        if not info or "error" in info:
+            print(f"❌ 无法获取 {ticker} 的数据: {info.get('error', '数据为空') if info else '数据为空'}")
+            return
+
+    name = info.get("shortName") or info.get("longName") or ticker
+    source = info.get("_source", "unknown")
+
+    market = detect_market(ticker)
+    pe = info.get("trailingPE") or info.get("forwardPE")
+    eps = info.get("trailingEps")
+    roe = info.get("returnOnEquity")
+    pb = info.get("priceToBook")
+    market_cap = info.get("marketCap")
+    profit_margin = info.get("profitMargins")
+    revenue_growth = info.get("revenueGrowth")
+    sector = info.get("sector", "N/A")
+    industry = info.get("industry", "N/A")
+    beta = info.get("beta")
+
+    source_names = {"yahoo": "Yahoo Finance", "sina": "新浪财经", "tencent": "腾讯财经",
+                    "baostock": "baostock", "akshare": "AKShare", "stooq": "Stooq"}
+
+    print(f"\n📊 {name} ({ticker}) — 基本面分析")
+    print(f"   数据源: {source_names.get(source, source)}")
+    if industry != "N/A" or sector != "N/A":
+        print(f"   行业: {industry} / {sector}")
+    print()
+
+    # PE
+    if pe:
+        level = "偏低 (相对便宜)" if pe < 15 else "适中" if pe < 25 else "偏高 (市场预期高,但可能贵)"
+        print(f"   📌 PE (市盈率): {pe:.2f}")
+        print(f"      💡 白话: 股价是盈利的 {pe:.1f} 倍。{level}")
+        print(f"         意思是: 如果你花 {pe:.1f} 元买这只股票, 理论上要 {pe:.1f} 年才能通过公司利润\"回本\"。")
+    else:
+        print(f"   📌 PE (市盈率): 暂无数据（A股可尝试东方财富/同花顺查看）")
+
+    # EPS
+    if eps:
+        print(f"\n   📌 EPS (每股收益): {eps:.2f}")
+        print(f"      💡 白话: 每一股在一年里给公司赚了 {eps:.2f} 元利润。")
+        if pe and eps:
+            print(f"         股价 ≈ PE × EPS = {pe:.1f} × {eps:.2f} ≈ {pe * eps:.2f}")
+    else:
+        print(f"\n   📌 EPS (每股收益): 暂无数据")
+
+    # ROE
+    if roe:
+        roe_pct = roe * 100 if roe < 1 else roe
+        level = "优秀" if roe_pct > 15 else "良好" if roe_pct > 10 else "一般"
+        print(f"\n   📌 ROE (净资产收益率): {roe_pct:.1f}%")
+        print(f"      💡 白话: 股东每投 100 元, 公司一年能赚 {roe_pct:.1f} 元利润。{level}!")
+        print(f"         这是巴菲特最看重的指标之一, ROE > 15% 通常被认为是好公司。")
+    else:
+        print(f"\n   📌 ROE (净资产收益率): 暂无数据")
+
+    # PB
+    if pb:
+        level = "低于净资产 (破净)" if pb < 1 else "正常" if pb < 3 else "偏高"
+        print(f"\n   📌 PB (市净率): {pb:.2f}")
+        print(f"      💡 白话: 股价是每股净资产的 {pb:.1f} 倍。{level}")
+
+    # 利润率
+    if profit_margin:
+        pm_pct = profit_margin * 100 if profit_margin < 1 else profit_margin
+        print(f"\n   📌 利润率: {pm_pct:.1f}%")
+        print(f"      💡 白话: 公司每收入 100 元, 最后能赚 {pm_pct:.1f} 元。")
+
+    # 市值
+    if market_cap:
+        if market_cap > 1e12:
+            cap_str = f"{market_cap / 1e12:.2f} 万亿"
+        elif market_cap > 1e8:
+            cap_str = f"{market_cap / 1e8:.2f} 亿"
+        else:
+            cap_str = f"{market_cap:,.0f}"
+        print(f"\n   📌 总市值: {cap_str}")
+
+    # 营收增速
+    if revenue_growth:
+        rg_pct = revenue_growth * 100 if revenue_growth < 1 else revenue_growth
+        print(f"\n   📌 营收增速: {rg_pct:+.1f}%")
+        print(f"      💡 白话: 相比去年同期, 公司收入{'增长' if rg_pct > 0 else '下降'}了 {abs(rg_pct):.1f}%。")
+
+    # Beta
+    if beta:
+        level = "波动大" if beta > 1.5 else "正常" if beta > 0.8 else "波动小"
+        print(f"\n   📌 Beta: {beta:.2f} ({level})")
+        print(f"      💡 白话: 大盘涨跌 1%, 这只股票平均涨跌 {beta:.1f}%。Beta > 1 说明比大盘更刺激。")
+
+    print(f"\n⚠️ 免责声明: 以上仅为指标解释, 不构成任何投资建议。\n")
+
+
+def cmd_earnings(ticker: str):
+    """财报日历"""
+    info = get_info_fundamentals(ticker)
+    if not info or "error" in info:
+        info = get_info_quote(ticker)
+        if not info or "error" in info:
+            print(f"❌ 无法获取 {ticker} 的数据")
+            return
+
+    name = info.get("shortName") or info.get("longName") or ticker
+    market = detect_market(ticker)
+
+    print(f"\n📅 {name} ({ticker}) — 财报日历")
+
+    if market in ("sh", "sz"):
+        print(f"   A股财报日历:")
+        print(f"      一季报: 4月30日前")
+        print(f"      中报:   8月31日前")
+        print(f"      三季报: 10月31日前")
+        print(f"      年报:   次年4月30日前")
+        print(f"   💡 具体日期请查看东方财富财报日历: https://data.eastmoney.com/bbsj/")
+        print()
+        return
+
+    # 美股/港股 — 试 Yahoo
+    import yfinance as yf
+    yahoo_code = to_yahoo_ticker(ticker) if market == "hk" else ticker
+
+    try:
+        stock = yf.Ticker(yahoo_code)
+        earnings_dates = stock.earnings_dates
+        if earnings_dates is not None and not earnings_dates.empty:
+            print(f"\n   历史财报:")
+            for idx, row in earnings_dates.sort_index(ascending=False).head(4).iterrows():
+                eps = row.get("Reported EPS", "N/A")
+                est = row.get("EPS Estimate", "N/A")
+                date_str = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)[:10]
+                if pd.notna(eps) and pd.notna(est) and est != 0:
+                    surprise = (eps - est) / abs(est) * 100
+                    emoji = "🟢" if surprise > 0 else "🔴"
+                    print(f"      {emoji} {date_str}: EPS {eps} vs 预期 {est} ({surprise:+.1f}%)")
+                else:
+                    print(f"      ➖ {date_str}: EPS {eps}")
+
+        cal = stock.calendar
+        if cal is not None and not cal.empty:
+            next_date = cal.iloc[0].get("Earnings Date", None)
+            if next_date is not None and pd.notna(next_date):
+                print(f"\n   📆 下次财报: {next_date}")
+    except Exception as e:
+        msg = str(e).lower()
+        if "rate" in msg or "429" in msg:
+            print(f"   ⚠️ Yahoo 限流，财报数据暂时不可用")
+        else:
+            print(f"   财报数据暂时不可用")
+
+    print(f"\n💡 财报公布前后股价通常大幅波动, 请留意风险。")
+    print(f"⚠️ 免责声明: 以上仅为信息展示, 不构成投资建议。\n")
+
+
+def cmd_history(ticker: str):
+    """近 10 日历史趋势"""
+    from rich.console import Console
+    from rich.table import Table
+    console = Console()
+
+    info = get_info_quote(ticker)
+    name = info.get("shortName") or ticker if info else ticker
+
+    df = _fetch_history(ticker, "1mo")
+    if df is None or df.empty:
+        print(f"❌ 无法获取 {ticker} 的历史数据")
+        return
+
+    recent = df.tail(10)
+    table = Table(title=f"{name} ({ticker}) — 近 10 日行情")
+    table.add_column("日期", style="cyan")
+    table.add_column("开盘")
+    table.add_column("最高")
+    table.add_column("最低")
+    table.add_column("收盘")
+    table.add_column("涨跌幅")
+    table.add_column("成交量")
+
+    prev_close = None
+    for date, row in recent.iterrows():
+        date_str = date.strftime("%m/%d") if hasattr(date, "strftime") else str(date)[:5]
+        close = float(row["Close"])
+        change_pct = ""
+        if prev_close and prev_close != 0:
+            chg = (close - prev_close) / prev_close * 100
+            color = "🟢" if chg > 0 else "🔴" if chg < 0 else "⚪"
+            change_pct = f"{color} {chg:+.2f}%"
+        vol = float(row["Volume"])
+        vol_str = f"{vol / 1e8:.1f}亿" if vol > 1e8 else f"{vol / 1e4:.0f}万" if vol > 1e4 else f"{vol:,.0f}"
+        table.add_row(date_str, f"{row['Open']:.2f}", f"{row['High']:.2f}", f"{row['Low']:.2f}", f"{close:.2f}", change_pct, vol_str)
+        prev_close = close
+
+    console.print(table)
+    print()
+
+
+# ──────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="China Stock Market Pro")
+    subparsers = parser.add_subparsers(dest="command")
+
+    p = subparsers.add_parser("price", help="实时报价")
+    p.add_argument("ticker")
+
+    c = subparsers.add_parser("chart", help="K线图/折线图")
+    c.add_argument("ticker")
+    c.add_argument("period", nargs="?", default="6mo",
+                   help="时间范围: 30d(近30天), 90d(近3个月), 6mo(近6个月/默认), 1y(近1年), 5y(近5年), max(全部)")
+    c.add_argument("style", nargs="?", default="candle", choices=["candle", "line"], help="candle=蜡烛图, line=折线图")
+
+    f = subparsers.add_parser("fundamentals", help="基本面分析（带新手解释）")
+    f.add_argument("ticker")
+
+    e = subparsers.add_parser("earnings", help="财报日历")
+    e.add_argument("ticker")
+
+    h = subparsers.add_parser("history", help="近10日趋势")
+    h.add_argument("ticker")
+
+    comp = subparsers.add_parser("compare", help="多股票走势对比图（归一化百分比）")
+    comp.add_argument("tickers", nargs="+",
+                      help="股票代码列表，空格分隔（如: 600519 AAPL 000858）")
+    comp.add_argument("--period", "-p", default="6mo",
+                      help="时间范围: 30d, 90d, 6mo(默认), 1y, 5y, max")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    # compare handles multiple tickers differently
+    if args.command == "compare":
+        tickers = [t.upper().strip() for t in args.tickers]
+        cmd_compare(tickers, args.period)
+        return
+
+    ticker = args.ticker.upper().strip()
+
+    if args.command == "price":
+        cmd_price(ticker)
+    elif args.command == "chart":
+        cmd_chart(ticker, args.period, args.style)
+    elif args.command == "fundamentals":
+        cmd_fundamentals(ticker)
+    elif args.command == "earnings":
+        cmd_earnings(ticker)
+    elif args.command == "history":
+        cmd_history(ticker)
+
+
+if __name__ == "__main__":
+    main()
