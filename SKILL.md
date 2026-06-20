@@ -48,20 +48,24 @@ uv run --script scripts/cnstock chart 600519 90d line
 **小白解释**:K线图(蜡烛图)上每一根"棒子"代表一天(或一周)的价格波动,红涨绿跌(或绿涨红跌,看你软件设置)。MA5/MA20/MA60 是"过去5天/20天/60天的平均价格",用来看趋势是涨是跌,不是用来预测明天会怎样的。图表生成后会自动弹窗打开。
 
 ### 3. Fundamental Analysis (`fundamentals`)
-Deep dive into valuation: Market Cap, PE, EPS, ROE, and Profit Margins.
+Deep dive into valuation: PE, PEG, PB, EPS, ROE, ROA, Margins, EV/EBITDA, FCF, Debt/Equity, Dividend Yield, 52-Week Range, and Analyst Consensus — all with plain-language explanations.
 ```bash
 uv run --script scripts/cnstock fundamentals [TICKER]
 ```
+**美股独有增强**: PEG、EV/EBITDA、毛利/运营/净利率、ROA、负债权益比、流动比率、自由现金流、股息率、52周位置可视化、分析师目标价。A股仅支持 Sina/Tencent 提供的基础字段。
 **小白解释这几个指标到底是什么**:
 - **PE(市盈率)**:说白了就是"这家公司现在的股价,是它一年赚的钱的多少倍"。PE 越高,说明大家越愿意为它的未来买单(但也可能是太贵了)。
 - **EPS(每股收益)**:公司一年赚的钱,平均分到每一股上是多少。数字越大,说明这股票"含金量"越高。
 - **ROE(净资产收益率)**:公司用股东的钱,一年能赚回多少比例。比如 ROE=15%,意思是股东每投100块,一年能帮你赚回15块的利润(注意,这不是分红,是公司账面上的盈利能力)。
 - **Profit Margin(利润率)**:公司每赚100块收入,最后能留下多少利润,留得越多说明公司越"赚钱效率高"。
 
-### 4. Earnings & Estimates (`earnings`)
-Check upcoming earnings dates and market consensus (Expected Revenue/EPS).
+### 4. Earnings Calendar & Countdown (`earnings`)
+Check upcoming earnings dates, historical surprises, and **countdown warnings**.
 
-**小白解释**:这个是查"这家公司啥时候公布财报"以及"大家(分析师)猜它能赚多少钱"。财报公布前后股价经常大幅波动,知道日期能帮你提前有心理准备。
+**小白解释**: 不仅告诉你财报啥时候出，还会倒计时提醒。财报前14天内会自动警告"波动加大，建议等财报落地"。美股还显示分析师预期营收和 EPS。
+
+**A 股**: 法定披露截止日倒计时（一季报 4/30、中报 8/31、三季报 10/31、年报次年 4/30），密集期临近时发出提醒。
+**美股**: Yahoo Finance 精确财报日 + 倒计时天数 + 前后风险提示。
 
 ### 5. Historical Trends (`history`)
 View recent 10-day trends with terminal-friendly ASCII charts.
@@ -69,7 +73,16 @@ View recent 10-day trends with terminal-friendly ASCII charts.
 uv run --script scripts/cnstock history [TICKER]
 ```
 
-### 6. Multi-Stock Comparison (`compare`)
+### 6. Market Temperature (`market`)
+Quick health check of the broader market — no ticker needed.
+```bash
+uv run --script scripts/cnstock market
+```
+**小白解释**：一键看大盘温度。美股市场显示 VIX 恐慌指数 + SPY/QQQ 涨跌 + 黄金/美债/美元避险信号。A股显示上证指数实时行情。如果 VIX 飚了或者资金涌入避险资产（黄金+美债+美元齐涨），会高亮警告。15分钟缓存，不用担心频繁请求被限。
+
+**避险模式检测**：当 GLD +2%、TLT +1%、UUP +1% 同时触发 → 标记"🛡️ 避险模式"，提醒股市风险偏高。
+
+### 7. Multi-Stock Comparison (`compare`)
 Overlay normalized price performance of multiple stocks on a single chart.
 ```bash
 uv run --script scripts/cnstock compare 600519 000858 --period 6mo
@@ -77,7 +90,7 @@ uv run --script scripts/cnstock compare AAPL MSFT GOOGL --period 1y
 ```
 **小白解释**：把几只股票的走势放在同一张图上对比，统一从"0%涨跌幅"开始算，方便看谁涨得多、谁跌得多。比单独看每只股票的图更直观。
 
-### 7. Portfolio Management (`portfolio.py`)
+### 8. Portfolio Management (`portfolio.py`)
 Create portfolios, add/remove holdings, and track real-time P&L across stocks and crypto.
 ```bash
 # 组合管理
@@ -93,7 +106,7 @@ uv run scripts/portfolio.py delete "我的组合"
 ```
 **小白解释**: 这个功能就是帮你记录你买了什么股票、成本多少、现在赚了还是亏了。不用自己拿计算器算了。
 
-### 8. China A-Share Support — Powered by AkShare
+### 9. China A-Share Support — Powered by AkShare
 For Shanghai/Shenzhen listed stocks, this tool automatically detects the market and switches to **AkShare** as the data engine — no special flags needed.
 
 ```bash
@@ -142,10 +155,14 @@ When a user asks about a stock, Claude MUST present results in the following fix
 | 指标 | 数值 | 一句话解读 |
 |---|---|---|
 | PE (市盈率) | XX.X | 偏低/适中/偏高 |
+| PEG (市盈增长比) | X.X | 低估/合理 (美股独有) |
 | EPS (每股收益) | XX.X | 每股盈利能力 |
-| PB (市净率) | X.X | 相对净资产溢价 |
 | ROE | X.X% | 股东回报效率 |
+| 利润率 (Gross/Op/Net) | X%/X%/X% | 赚钱效率 (美股独有) |
+| 负债权益比 / 流动比率 | X.X / X.X | 财务安全度 (美股独有) |
+| EV/EBITDA | X.X | 企业估值倍数 (美股独有) |
 | 总市值 | X.XX万亿 | 市场体量 |
+| 52周位置 | [████░░░] X% | 当前在52周区间的位 |
 
 ### 📉 近期走势 (近10日)
 
@@ -255,7 +272,8 @@ After generating a chart, always mention the file path (`/tmp/{ticker}_{period}_
 
 ### Data Freshness (数据时效性)
 - **A股实时行情 (Sina/Tencent)**: 盘中 ~3秒延迟，盘后显示当日收盘价。周末/节假日显示上一交易日收盘价。
-- **美股行情 (Yahoo Finance)**: 可能有 15-20 分钟延迟（非实时用户），盘后/盘前数据可能不完整。
+- **美股行情 (Yahoo Finance)**: 可能有 15-20 分钟延迟（非实时用户），盘后/盘前数据可能不完整。**YF 容易限流 (429)**，限流时自动指数退避重试，极端情况下可能降级到 HTTP 直连或返回空数据。
+- **市场温度计 (market)**: VIX/SPY/QQQ 15分钟缓存 TTL；上证指数实时。YF 限流时美股部分可能为空。
 - **Crypto (Yahoo Finance)**: 接近实时，但极端行情下可能延迟。
 
 ### A股特有局限
@@ -331,7 +349,9 @@ When a command fails or returns partial data, DO NOT retry the same command. Ins
 
 5. **缓存数据** → 如果输出中包含 `⚡缓存` 标记，告知用户这是缓存数据（5分钟内查询过），如需刷新等几分钟后再试。
 
-6. **非A股/美股股票** → 如果用户查询港股或加密货币但仍可用，标注数据源和质量。如果完全不支持，如实告知。
+6. **市场温度计无数据** → 美股或 A 股某一边可能因限流/网络问题无数据。正常展示可用的一边，缺失的标注"暂不可用"。不要因为美股没数据就放弃展示 A 股部分。
+
+7. **非A股/美股股票** → 如果用户查询港股或加密货币但仍可用，标注数据源和质量。如果完全不支持，如实告知。
 
 ---
 

@@ -30,6 +30,7 @@ Usage:
     uv run --script scripts/cnstock fundamentals TICKER
     uv run --script scripts/cnstock earnings TICKER
     uv run --script scripts/cnstock history TICKER
+    uv run --script scripts/cnstock market
 """
 
 import argparse
@@ -689,9 +690,10 @@ def get_info_fundamentals(ticker: str) -> dict:
         fin = _fetch_cn_finance_info(ticker)
         if fin:
             info = info or {}
-            for k in ("trailingPE", "priceToBook", "marketCap", "trailingEps"):
-                if k in fin and k not in info:
-                    info[k] = fin[k]
+            # 合并所有可用字段
+            for k, v in fin.items():
+                if v is not None and (k not in info or info.get(k) is None):
+                    info[k] = v
         else:
             # 腾讯接口没数据，试 AKShare
             try:
@@ -1027,12 +1029,10 @@ def _fetch_history(ticker: str, period: str) -> pd.DataFrame | None:
 
 def cmd_fundamentals(ticker: str):
     """基本面分析（带新手解释）"""
-    # 先看缓存
     info = get_info_fundamentals(ticker)
 
     if not info or "error" in info:
         err = info.get("error", "") if info else ""
-        # 无缓存 → 强制获取
         info = get_info_quote(ticker)
         if not info or "error" in info:
             print(f"❌ 无法获取 {ticker} 的数据: {info.get('error', '数据为空') if info else '数据为空'}")
@@ -1040,69 +1040,124 @@ def cmd_fundamentals(ticker: str):
 
     name = info.get("shortName") or info.get("longName") or ticker
     source = info.get("_source", "unknown")
-
     market = detect_market(ticker)
-    pe = info.get("trailingPE") or info.get("forwardPE")
-    eps = info.get("trailingEps")
-    roe = info.get("returnOnEquity")
-    pb = info.get("priceToBook")
-    market_cap = info.get("marketCap")
-    profit_margin = info.get("profitMargins")
-    revenue_growth = info.get("revenueGrowth")
-    sector = info.get("sector", "N/A")
-    industry = info.get("industry", "N/A")
-    beta = info.get("beta")
+    is_us = market not in ("sh", "sz", "hk")
 
     source_names = {"yahoo": "Yahoo Finance", "sina": "新浪财经", "tencent": "腾讯财经",
-                    "baostock": "baostock", "akshare": "AKShare", "stooq": "Stooq"}
+                    "baostock": "baostock", "akshare": "AKShare", "stooq": "Stooq",
+                    "yahoo-direct": "Yahoo (直连)"}
 
     print(f"\n📊 {name} ({ticker}) — 基本面分析")
     print(f"   数据源: {source_names.get(source, source)}")
-    if industry != "N/A" or sector != "N/A":
+    sector = info.get("sector", "")
+    industry = info.get("industry", "")
+    if industry or sector:
         print(f"   行业: {industry} / {sector}")
     print()
 
-    # PE
+    # ── 估值指标 ──
+    print(f"   ━━━ 估值指标 ━━━")
+
+    pe = info.get("trailingPE") or info.get("forwardPE")
     if pe:
         level = "偏低 (相对便宜)" if pe < 15 else "适中" if pe < 25 else "偏高 (市场预期高,但可能贵)"
-        print(f"   📌 PE (市盈率): {pe:.2f}")
-        print(f"      💡 白话: 股价是盈利的 {pe:.1f} 倍。{level}")
-        print(f"         意思是: 如果你花 {pe:.1f} 元买这只股票, 理论上要 {pe:.1f} 年才能通过公司利润\"回本\"。")
+        print(f"   📌 PE (市盈率): {pe:.2f}  — {level}")
     else:
-        print(f"   📌 PE (市盈率): 暂无数据（A股可尝试东方财富/同花顺查看）")
+        print(f"   📌 PE (市盈率): 暂无数据")
 
-    # EPS
+    forward_pe = info.get("forwardPE")
+    if forward_pe and is_us:
+        print(f"   📌 远期PE: {forward_pe:.2f}  (基于未来预期利润)")
+
+    peg = info.get("pegRatio")
+    if peg and is_us:
+        level = "低估" if peg < 1 else "合理" if peg < 1.5 else "偏贵"
+        print(f"   📌 PEG (市盈增长比): {peg:.2f}  — {level} (<1 通常算便宜)")
+
+    pb = info.get("priceToBook")
+    if pb:
+        level = "破净" if pb < 1 else "正常" if pb < 3 else "偏高"
+        print(f"   📌 PB (市净率): {pb:.2f}  — {level}")
+
+    ps = info.get("priceToSalesTrailing12Months")
+    if ps and is_us:
+        print(f"   📌 PS (市销率): {ps:.2f}")
+
+    # ── 盈利能力 ──
+    print(f"\n   ━━━ 盈利能力 ━━━")
+
+    eps = info.get("trailingEps")
     if eps:
-        print(f"\n   📌 EPS (每股收益): {eps:.2f}")
-        print(f"      💡 白话: 每一股在一年里给公司赚了 {eps:.2f} 元利润。")
-        if pe and eps:
-            print(f"         股价 ≈ PE × EPS = {pe:.1f} × {eps:.2f} ≈ {pe * eps:.2f}")
+        print(f"   📌 EPS (每股收益): {eps:.2f}")
+        if pe:
+            print(f"      💡 股价 ≈ PE × EPS = {pe:.1f} × {eps:.2f} ≈ {pe * eps:.2f}")
     else:
-        print(f"\n   📌 EPS (每股收益): 暂无数据")
+        print(f"   📌 EPS (每股收益): 暂无数据")
 
-    # ROE
+    roe = info.get("returnOnEquity")
     if roe:
         roe_pct = roe * 100 if roe < 1 else roe
         level = "优秀" if roe_pct > 15 else "良好" if roe_pct > 10 else "一般"
-        print(f"\n   📌 ROE (净资产收益率): {roe_pct:.1f}%")
-        print(f"      💡 白话: 股东每投 100 元, 公司一年能赚 {roe_pct:.1f} 元利润。{level}!")
-        print(f"         这是巴菲特最看重的指标之一, ROE > 15% 通常被认为是好公司。")
-    else:
-        print(f"\n   📌 ROE (净资产收益率): 暂无数据")
+        print(f"   📌 ROE (净资产收益率): {roe_pct:.1f}%  — {level}")
 
-    # PB
-    if pb:
-        level = "低于净资产 (破净)" if pb < 1 else "正常" if pb < 3 else "偏高"
-        print(f"\n   📌 PB (市净率): {pb:.2f}")
-        print(f"      💡 白话: 股价是每股净资产的 {pb:.1f} 倍。{level}")
+    roa = info.get("returnOnAssets")
+    if roa and is_us:
+        print(f"   📌 ROA (总资产收益率): {roa * 100 if roa < 1 else roa:.1f}%")
 
-    # 利润率
-    if profit_margin:
-        pm_pct = profit_margin * 100 if profit_margin < 1 else profit_margin
-        print(f"\n   📌 利润率: {pm_pct:.1f}%")
-        print(f"      💡 白话: 公司每收入 100 元, 最后能赚 {pm_pct:.1f} 元。")
+    gross_margin = info.get("grossMargins")
+    op_margin = info.get("operatingMargins")
+    net_margin = info.get("profitMargins")
+    if any([gross_margin, op_margin, net_margin]) and is_us:
+        parts = []
+        if gross_margin:
+            parts.append(f"毛利 {gross_margin * 100 if gross_margin < 1 else gross_margin:.1f}%")
+        if op_margin:
+            parts.append(f"运营 {op_margin * 100 if op_margin < 1 else op_margin:.1f}%")
+        if net_margin:
+            parts.append(f"净利 {net_margin * 100 if net_margin < 1 else net_margin:.1f}%")
+        print(f"   📌 利润率: {' | '.join(parts)}")
+    elif net_margin:
+        pm_pct = net_margin * 100 if net_margin < 1 else net_margin
+        print(f"   📌 净利率: {pm_pct:.1f}%")
 
-    # 市值
+    # ── 成长性 ──
+    rev_g = info.get("revenueGrowth")
+    earn_g = info.get("earningsGrowth")
+    if rev_g or earn_g:
+        print(f"\n   ━━━ 成长性 ━━━")
+        if rev_g:
+            rg_pct = rev_g * 100 if abs(rev_g) < 1 else rev_g
+            print(f"   📌 营收增速 (YoY): {rg_pct:+.1f}%")
+        if earn_g and is_us:
+            eg_pct = earn_g * 100 if abs(earn_g) < 1 else earn_g
+            print(f"   📌 盈利增速 (YoY): {eg_pct:+.1f}%")
+
+    # ── 财务健康 ──
+    if is_us:
+        debt_eq = info.get("debtToEquity")
+        curr_ratio = info.get("currentRatio")
+        fcf = info.get("freeCashflow")
+        if debt_eq or curr_ratio or fcf:
+            print(f"\n   ━━━ 财务健康 ━━━")
+            if debt_eq:
+                level = "偏高" if debt_eq > 200 else "正常" if debt_eq > 50 else "保守"
+                print(f"   📌 负债权益比: {debt_eq:.1f}  — {level}")
+            if curr_ratio:
+                level = "充足" if curr_ratio > 2 else "正常" if curr_ratio > 1 else "偏低 ⚠️"
+                print(f"   📌 流动比率: {curr_ratio:.2f}  — {level}")
+            if fcf:
+                if abs(fcf) >= 1e9:
+                    fcf_str = f"${fcf / 1e9:,.1f}B"
+                elif abs(fcf) >= 1e6:
+                    fcf_str = f"${fcf / 1e6:,.0f}M"
+                else:
+                    fcf_str = f"${fcf:,.0f}"
+                print(f"   📌 自由现金流: {fcf_str}")
+
+    # ── 市值与分红 ──
+    print(f"\n   ━━━ 市值与分红 ━━━")
+    market_cap = info.get("marketCap")
+    ev = info.get("enterpriseValue")
     if market_cap:
         if market_cap > 1e12:
             cap_str = f"{market_cap / 1e12:.2f} 万亿"
@@ -1110,25 +1165,68 @@ def cmd_fundamentals(ticker: str):
             cap_str = f"{market_cap / 1e8:.2f} 亿"
         else:
             cap_str = f"{market_cap:,.0f}"
-        print(f"\n   📌 总市值: {cap_str}")
+        print(f"   📌 总市值: {cap_str}")
+    if ev and is_us:
+        if abs(ev) >= 1e9:
+            ev_str = f"${ev / 1e9:,.1f}B"
+        else:
+            ev_str = f"${ev / 1e6:,.0f}M"
+        print(f"   📌 企业价值 (EV): {ev_str}")
+        ev_ebitda = info.get("enterpriseToEbitda")
+        if ev_ebitda:
+            print(f"   📌 EV/EBITDA: {ev_ebitda:.2f}")
 
-    # 营收增速
-    if revenue_growth:
-        rg_pct = revenue_growth * 100 if revenue_growth < 1 else revenue_growth
-        print(f"\n   📌 营收增速: {rg_pct:+.1f}%")
-        print(f"      💡 白话: 相比去年同期, 公司收入{'增长' if rg_pct > 0 else '下降'}了 {abs(rg_pct):.1f}%。")
+    div_yield = info.get("dividendYield")
+    if div_yield and div_yield > 0:
+        dy_pct = div_yield * 100 if div_yield < 1 else div_yield
+        print(f"   📌 股息率: {dy_pct:.2f}%")
 
-    # Beta
+    # ── 52周区间 ──
+    w52_high = info.get("fiftyTwoWeekHigh")
+    w52_low = info.get("fiftyTwoWeekLow")
+    if w52_high and w52_low:
+        price = info.get("regularMarketPrice") or info.get("currentPrice")
+        if price:
+            pos = (price - w52_low) / (w52_high - w52_low) * 100 if w52_high != w52_low else 50
+            print(f"\n   ━━━ 52周位置 ━━━")
+            print(f"   📌 52周高: {w52_high:.2f}  |  52周低: {w52_low:.2f}")
+            bar_len = 20
+            filled = int(pos / 100 * bar_len)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            print(f"   📌 当前位置: [{bar}] {pos:.0f}%")
+            if pos > 90:
+                print(f"      ⚠️ 接近52周高点，注意追高风险")
+            elif pos < 20:
+                print(f"      💡 接近52周低点，可能是超跌区域")
+
+    # ── 分析师 (仅美股) ──
+    if is_us:
+        target = info.get("targetMeanPrice")
+        rec = info.get("recommendationKey", "")
+        if target or rec:
+            print(f"\n   ━━━ 分析师共识 ━━━")
+            if rec:
+                print(f"   📌 综合评级: {rec}")
+            if target:
+                price = info.get("regularMarketPrice") or info.get("currentPrice")
+                print(f"   📌 目标均价: ${target:.2f}")
+                if price:
+                    upside = (target - price) / price * 100
+                    emoji = "🟢" if upside > 0 else "🔴"
+                    print(f"   📌 潜在空间: {emoji} {upside:+.1f}%")
+
+    # ── Beta ──
+    beta = info.get("beta")
     if beta:
-        level = "波动大" if beta > 1.5 else "正常" if beta > 0.8 else "波动小"
+        level = "波动大" if beta > 1.5 else "正常" if beta > 0.8 else "防御型"
         print(f"\n   📌 Beta: {beta:.2f} ({level})")
-        print(f"      💡 白话: 大盘涨跌 1%, 这只股票平均涨跌 {beta:.1f}%。Beta > 1 说明比大盘更刺激。")
+        print(f"      💡 大盘涨跌 1%, 这只股票平均涨跌 {beta:.1f}%。")
 
     print(f"\n⚠️ 免责声明: 以上仅为指标解释, 不构成任何投资建议。\n")
 
 
 def cmd_earnings(ticker: str):
-    """财报日历"""
+    """财报日历 + 倒计时提醒"""
     info = get_info_fundamentals(ticker)
     if not info or "error" in info:
         info = get_info_quote(ticker)
@@ -1138,28 +1236,54 @@ def cmd_earnings(ticker: str):
 
     name = info.get("shortName") or info.get("longName") or ticker
     market = detect_market(ticker)
+    now = datetime.now()
 
     print(f"\n📅 {name} ({ticker}) — 财报日历")
 
+    # ── A股: 法定披露截止日 + 倒计时 ──
     if market in ("sh", "sz"):
-        print(f"   A股财报日历:")
-        print(f"      一季报: 4月30日前")
-        print(f"      中报:   8月31日前")
-        print(f"      三季报: 10月31日前")
-        print(f"      年报:   次年4月30日前")
-        print(f"   💡 具体日期请查看东方财富财报日历: https://data.eastmoney.com/bbsj/")
+        year = now.year
+        deadlines = [
+            ("一季报", datetime(year, 4, 30)),
+            ("中报",   datetime(year, 8, 31)),
+            ("三季报", datetime(year, 10, 31)),
+            ("年报",   datetime(year + 1, 4, 30)),
+        ]
+        # 如果一季报/中报/三季报已过，加下一年份
+        adjusted = []
+        for label, dt in deadlines:
+            if dt < now and label != "年报":
+                adjusted.append((label, dt.replace(year=year + 1)))
+            else:
+                adjusted.append((label, dt))
+
+        print(f"\n   📋 A股法定披露截止日:")
+        nearest = None
+        for label, dt in adjusted:
+            days_left = (dt - now).days
+            bar = "🔴" if days_left <= 7 else "🟡" if days_left <= 21 else "🟢"
+            print(f"      {bar} {label}: {dt.strftime('%Y-%m-%d')} (还剩 {days_left} 天)")
+            if nearest is None or days_left < nearest[1]:
+                nearest = (label, days_left)
+
+        if nearest and nearest[1] <= 14:
+            print(f"\n   ⚠️ [bold red]财报密集期临近![/bold red] 距 {nearest[0]} 截止仅剩 {nearest[1]} 天。")
+            print(f"      财报公布前后股价通常大幅波动，请留意持仓风险。")
+        print(f"   💡 具体公告日期请查看: https://data.eastmoney.com/bbsj/")
         print()
         return
 
-    # 美股/港股 — 试 Yahoo
+    # ── 美股/港股: Yahoo Finance ──
     import yfinance as yf
     yahoo_code = to_yahoo_ticker(ticker) if market == "hk" else ticker
 
     try:
         stock = yf.Ticker(yahoo_code)
+
+        # ── 历史财报 ──
         earnings_dates = stock.earnings_dates
         if earnings_dates is not None and not earnings_dates.empty:
-            print(f"\n   历史财报:")
+            print(f"\n   📜 历史财报:")
             for idx, row in earnings_dates.sort_index(ascending=False).head(4).iterrows():
                 eps = row.get("Reported EPS", "N/A")
                 est = row.get("EPS Estimate", "N/A")
@@ -1171,17 +1295,63 @@ def cmd_earnings(ticker: str):
                 else:
                     print(f"      ➖ {date_str}: EPS {eps}")
 
+        # ── 下次财报 + 倒计时 ──
         cal = stock.calendar
         if cal is not None and not cal.empty:
-            next_date = cal.iloc[0].get("Earnings Date", None)
-            if next_date is not None and pd.notna(next_date):
-                print(f"\n   📆 下次财报: {next_date}")
+            next_date_raw = cal.iloc[0].get("Earnings Date", None)
+            if next_date_raw is not None and pd.notna(next_date_raw):
+                if hasattr(next_date_raw, 'strftime'):
+                    next_date = next_date_raw
+                elif hasattr(next_date_raw, 'to_pydatetime'):
+                    next_date = next_date_raw.to_pydatetime()
+                else:
+                    next_date = pd.Timestamp(next_date_raw).to_pydatetime()
+
+                days_left = (next_date - now).days
+
+                print(f"\n   📆 [bold]下次财报日: {next_date.strftime('%Y-%m-%d')}[/bold]")
+
+                # ── 倒计时警告 ──
+                if days_left < 0:
+                    print(f"      ✅ 已过 ({abs(days_left)} 天前)")
+                    # 检查财报后是否大涨
+                    try:
+                        hist = stock.history(period="5d")
+                        if not hist.empty:
+                            chg_5d = (hist["Close"].iloc[-1] / hist["Close"].iloc[0] - 1) * 100
+                            if chg_5d > 15:
+                                print(f"      ⚠️ 财报后 5 日已涨 {chg_5d:+.1f}% — 利好可能已充分兑现")
+                    except Exception:
+                        pass
+                elif days_left <= 3:
+                    print(f"      🔴 [bold red]仅剩 {days_left} 天![/bold red] 财报窗口期，波动剧烈，谨慎开新仓。")
+                elif days_left <= 7:
+                    print(f"      🟠 仅剩 {days_left} 天 — 短期内即将公布，波动加大")
+                elif days_left <= 14:
+                    print(f"      🟡 还剩 {days_left} 天 — 进入财报提前反应期")
+                else:
+                    print(f"      🟢 还剩 {days_left} 天")
+
+                if days_left > 0 and days_left <= 14:
+                    print(f"      💡 财报前 14 天: BUY 信号建议自动降级为 HOLD，等财报落地再做判断")
+
+        # ── 分析师预期 ──
+        rev_est = info.get("revenueEstimate")
+        eps_est = info.get("forwardEps")
+        if rev_est or eps_est:
+            print(f"\n   🔮 分析师一致预期:")
+            if rev_est:
+                est_str = f"${rev_est / 1e9:.1f}B" if rev_est >= 1e9 else f"${rev_est / 1e6:.0f}M"
+                print(f"      预期营收: {est_str}")
+            if eps_est:
+                print(f"      预期 EPS: ${eps_est:.2f}")
+
     except Exception as e:
         msg = str(e).lower()
         if "rate" in msg or "429" in msg:
             print(f"   ⚠️ Yahoo 限流，财报数据暂时不可用")
         else:
-            print(f"   财报数据暂时不可用")
+            print(f"   财报数据暂时不可用: {e}")
 
     print(f"\n💡 财报公布前后股价通常大幅波动, 请留意风险。")
     print(f"⚠️ 免责声明: 以上仅为信息展示, 不构成投资建议。\n")
@@ -1229,6 +1399,206 @@ def cmd_history(ticker: str):
     print()
 
 
+def cmd_market():
+    """市场温度计 — VIX/SPY/上证指数 + 避险信号"""
+    from rich.console import Console
+    from rich.table import Table
+    console = Console()
+
+    # ── 检查缓存 ──
+    cached = _cache_get("_market", "context", 900)  # 15min TTL
+    if cached:
+        _print_market_report(cached)
+        if cached.get("_from_cache"):
+            print("   ⚡ 缓存数据 (15分钟内有效)\n")
+        return
+
+    console.print("[bold]🌡️  正在获取市场温度...")
+
+    result = {}
+    now = datetime.now()
+
+    # ── 美股: VIX + SPY + QQQ ──
+    try:
+        import yfinance as yf
+        for attempt in range(3):
+            try:
+                vix = yf.Ticker("^VIX")
+                vix_info = vix.info
+                vix_price = (vix_info.get("regularMarketPrice") or
+                            vix_info.get("currentPrice") or
+                            vix.history(period="2d")["Close"].iloc[-1])
+                result["vix"] = float(vix_price) if vix_price else None
+
+                spy = yf.Ticker("SPY")
+                spy_hist = spy.history(period="1mo")
+                if not spy_hist.empty:
+                    spy_change_5d = (spy_hist["Close"].iloc[-1] / spy_hist["Close"].iloc[-6] - 1) * 100
+                    spy_change_1m = (spy_hist["Close"].iloc[-1] / spy_hist["Close"].iloc[0] - 1) * 100
+                    result["spy_5d"] = round(spy_change_5d, 2)
+                    result["spy_1m"] = round(spy_change_1m, 2)
+
+                qqq = yf.Ticker("QQQ")
+                qqq_hist = qqq.history(period="5d")
+                if not qqq_hist.empty:
+                    qqq_change_5d = (qqq_hist["Close"].iloc[-1] / qqq_hist["Close"].iloc[0] - 1) * 100
+                    result["qqq_5d"] = round(qqq_change_5d, 2)
+
+                # Safe-haven indicators (GLD, TLT, UUP)
+                for asset, key in [("GLD", "gld"), ("TLT", "tlt"), ("UUP", "uup")]:
+                    try:
+                        tick = yf.Ticker(asset)
+                        hist = tick.history(period="5d")
+                        if not hist.empty and len(hist) >= 2:
+                            chg = (hist["Close"].iloc[-1] / hist["Close"].iloc[0] - 1) * 100
+                            result[f"{key}_5d"] = round(chg, 2)
+                    except Exception:
+                        pass
+
+                # Risk-off detection
+                gld = result.get("gld_5d", 0) or 0
+                tlt = result.get("tlt_5d", 0) or 0
+                uup = result.get("uup_5d", 0) or 0
+                result["risk_off"] = (gld >= 2 and tlt >= 1 and uup >= 1)
+
+                break
+            except Exception:
+                time.sleep(1 * (attempt + 1))
+    except Exception:
+        pass
+
+    # ── A股: 上证指数 ──
+    try:
+        import requests, re
+        url = "https://hq.sinajs.cn/list=s_sh000001"
+        resp = requests.get(url, timeout=8, headers={"Referer": "https://finance.sina.com.cn"})
+        resp.encoding = "gbk"
+        m = re.search(r'"([^"]*)"', resp.text)
+        if m:
+            fields = m.group(1).split(",")
+            if len(fields) > 4:
+                result["sh_name"] = fields[0]
+                result["sh_price"] = _safe_float(fields[1])
+                result["sh_change"] = _safe_float(fields[2])
+                result["sh_change_pct"] = _safe_float(fields[3])
+    except Exception:
+        pass
+
+    if result:
+        result["cached_at"] = datetime.now().isoformat()
+        _cache_set("_market", "context", result)
+        result["_from_cache"] = False
+
+    _print_market_report(result)
+    print()
+
+
+def _print_market_report(data: dict):
+    """渲染市场温度报告"""
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    console = Console()
+
+    vix = data.get("vix")
+    risk_off = data.get("risk_off", False)
+
+    # ── 市场温度判定 ──
+    if vix:
+        if vix < 15:
+            temp, temp_emoji, temp_color = "平静", "😴", "green"
+        elif vix < 20:
+            temp, temp_emoji, temp_color = "正常", "🙂", "green"
+        elif vix < 25:
+            temp, temp_emoji, temp_color = "偏高", "😐", "yellow"
+        elif vix < 30:
+            temp, temp_emoji, temp_color = "紧张", "😰", "red"
+        else:
+            temp, temp_emoji, temp_color = "恐慌", "😱", "red"
+
+        if risk_off:
+            temp = f"避险模式 🛡️"
+
+        console.print(Panel(
+            f"[bold {temp_color}]{temp_emoji} 市场温度: {temp}[/bold {temp_color}]  |  "
+            f"VIX: [bold]{vix:.1f}[/bold]"
+            + ("  |  🛡️ 资金涌入黄金/美债/美元" if risk_off else ""),
+            border_style=temp_color
+        ))
+
+    # ── 美股 ──
+    if any(k in data for k in ("vix", "spy_5d", "qqq_5d")):
+        print()
+        tbl = Table(title="🇺🇸 美股市场", title_style="bold cyan")
+        tbl.add_column("指标"); tbl.add_column("数值"); tbl.add_column("解读")
+
+        if vix:
+            level = "极度平静" if vix < 12 else "平静" if vix < 20 else "紧张" if vix < 30 else "恐慌"
+            tbl.add_row("VIX 恐慌指数", f"{vix:.1f}", f"{level} — {'市场贪婪' if vix < 15 else '正常波动' if vix < 25 else '高波动风险'}")
+
+        spy_5d = data.get("spy_5d")
+        if spy_5d is not None:
+            emoji = "🟢" if spy_5d > 0 else "🔴"
+            tbl.add_row("SPY 近5日", f"{emoji} {spy_5d:+.1f}%", "标普500代表大盘方向")
+
+        spy_1m = data.get("spy_1m")
+        if spy_1m is not None:
+            emoji = "🟢" if spy_1m > 0 else "🔴"
+            tbl.add_row("SPY 近1月", f"{emoji} {spy_1m:+.1f}%", "中期趋势参考")
+
+        qqq_5d = data.get("qqq_5d")
+        if qqq_5d is not None:
+            emoji = "🟢" if qqq_5d > 0 else "🔴"
+            tbl.add_row("QQQ 近5日", f"{emoji} {qqq_5d:+.1f}%", "科技股情绪风向标")
+
+        for label, key in [("黄金 GLD", "gld"), ("美债 TLT", "tlt"), ("美元 UUP", "uup")]:
+            val = data.get(f"{key}_5d")
+            if val is not None:
+                emoji = "🟢" if val > 0 else "🔴"
+                tbl.add_row(f"{label} 5日", f"{emoji} {val:+.1f}%",
+                           "避险资金流入" if (key in ("gld", "tlt") and val > 1) or (key == "uup" and val > 0.5) else "")
+
+        console.print(tbl)
+
+    # ── A股 ──
+    sh_price = data.get("sh_price")
+    if sh_price:
+        print()
+        tbl2 = Table(title="🇨🇳 A股市场", title_style="bold red")
+        tbl2.add_column("指标"); tbl2.add_column("数值"); tbl2.add_column("解读")
+
+        name = data.get("sh_name", "上证指数")
+        chg = data.get("sh_change", 0) or 0
+        chg_pct = data.get("sh_change_pct", 0) or 0
+        emoji = "🟢" if chg >= 0 else "🔴"
+        sign = "+" if chg >= 0 else ""
+        tbl2.add_row(name, f"{sh_price:.2f}", f"{emoji} {sign}{chg:.2f} ({sign}{chg_pct:.2f}%)")
+
+        if chg_pct < -2:
+            tbl2.add_row("市场状态", "⚠️ 大跌", "恐慌性抛售，注意风险")
+        elif chg_pct < -1:
+            tbl2.add_row("市场状态", "偏弱", "短期谨慎")
+        elif chg_pct > 2:
+            tbl2.add_row("市场状态", "🔥 大涨", "追高需谨慎")
+        elif chg_pct > 1:
+            tbl2.add_row("市场状态", "偏强", "")
+
+        console.print(tbl2)
+
+    if not data or (not data.get("vix") and not data.get("sh_price")):
+        print("   ⚠️ 市场数据暂不可用，请稍后重试。")
+
+    # Risk-off summary
+    if risk_off:
+        print(f"\n   🛡️ [bold red]避险信号触发![/bold red]")
+        print(f"      黄金 +{data.get('gld_5d', 0):.1f}% | 美债 +{data.get('tlt_5d', 0):.1f}% | 美元 +{data.get('uup_5d', 0):.1f}%")
+        print(f"      资金正在涌入避险资产，股市风险偏高。BUY 类决策建议更加谨慎。")
+
+    cache_hint = " ⚡缓存" if data.get("_from_cache") else ""
+    if cache_hint:
+        print(f"\n   {cache_hint}")
+
+
 # ──────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────
@@ -1255,6 +1625,8 @@ def main():
     h = subparsers.add_parser("history", help="近10日趋势")
     h.add_argument("ticker")
 
+    mkt = subparsers.add_parser("market", help="市场温度计（VIX/上证指数/避险信号）")
+
     comp = subparsers.add_parser("compare", help="多股票走势对比图（归一化百分比）")
     comp.add_argument("tickers", nargs="+",
                       help="股票代码列表，空格分隔（如: 600519 AAPL 000858）")
@@ -1265,6 +1637,11 @@ def main():
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    # market has no ticker argument
+    if args.command == "market":
+        cmd_market()
+        return
 
     # compare handles multiple tickers differently
     if args.command == "compare":
