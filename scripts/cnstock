@@ -238,20 +238,193 @@ def _fetch_yahoo_direct(ticker: str) -> dict | None:
     return None
 
 
+def _fetch_yahoo_fundamentals_direct(ticker: str) -> dict | None:
+    """
+    Yahoo v10 quoteSummary API — HTTP 直连获取基本面字段（PE/EPS/市值等）。
+    当 yfinance 库被限流时作为独立降级通道。
+    需要先获取 cookie + crumb 才能调用 v10。
+    """
+    import requests
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+    })
+    try:
+        # Step 1: Get cookie from Yahoo (may return 404, that's fine)
+        session.get("https://fc.yahoo.com/", timeout=10)
+
+        # Step 2: Get crumb
+        crumb_resp = session.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=10)
+        if crumb_resp.status_code != 200:
+            return None
+        crumb = crumb_resp.text.strip()
+
+        # Step 3: Call v10 quoteSummary
+        modules = "price,summaryDetail,defaultKeyStatistics,financialData"
+        url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules={modules}&crumb={crumb}"
+        resp = session.get(url, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        result = data.get("quoteSummary", {}).get("result", [])
+        if not result:
+            return None
+        r = result[0]
+
+        def _get(*path):
+            d = r
+            for k in path:
+                d = d.get(k, {}) if isinstance(d, dict) else {}
+            return d if d and d != {} else None
+
+        info = {}
+        info["_source"] = "yahoo-direct"
+
+        # price module
+        p = _get("price")
+        if p:
+            info["shortName"] = p.get("shortName") or p.get("longName") or ticker
+            info["regularMarketPrice"] = p.get("regularMarketPrice", {}).get("raw")
+            info["regularMarketPreviousClose"] = p.get("regularMarketPreviousClose", {}).get("raw")
+            info["regularMarketDayHigh"] = p.get("regularMarketDayHigh", {}).get("raw")
+            info["regularMarketDayLow"] = p.get("regularMarketDayLow", {}).get("raw")
+            info["regularMarketVolume"] = p.get("regularMarketVolume", {}).get("raw")
+            info["marketCap"] = p.get("marketCap", {}).get("raw")
+
+        # summaryDetail
+        sd = _get("summaryDetail")
+        if sd:
+            info["trailingPE"] = sd.get("trailingPE", {}).get("raw")
+            info["forwardPE"] = sd.get("forwardPE", {}).get("raw")
+            info["priceToBook"] = sd.get("priceToBook", {}).get("raw")
+            info["dividendYield"] = sd.get("dividendYield", {}).get("raw")
+            info["fiftyTwoWeekHigh"] = sd.get("fiftyTwoWeekHigh", {}).get("raw")
+            info["fiftyTwoWeekLow"] = sd.get("fiftyTwoWeekLow", {}).get("raw")
+
+        # defaultKeyStatistics
+        dk = _get("defaultKeyStatistics")
+        if dk:
+            info["trailingEps"] = dk.get("trailingEps", {}).get("raw")
+            info["returnOnEquity"] = dk.get("returnOnEquity", {}).get("raw")
+            info["pegRatio"] = dk.get("pegRatio", {}).get("raw")
+            info["enterpriseValue"] = dk.get("enterpriseValue", {}).get("raw")
+            info["enterpriseToEbitda"] = dk.get("enterpriseToEbitda", {}).get("raw")
+            info["beta"] = dk.get("beta", {}).get("raw")
+            info["priceToSalesTrailing12Months"] = dk.get("priceToSalesTrailing12Months", {}).get("raw")
+
+        # financialData
+        fd = _get("financialData")
+        if fd:
+            info["revenueGrowth"] = fd.get("revenueGrowth", {}).get("raw")
+            info["earningsGrowth"] = fd.get("earningsGrowth", {}).get("raw")
+            info["grossMargins"] = fd.get("grossMargins", {}).get("raw")
+            info["operatingMargins"] = fd.get("operatingMargins", {}).get("raw")
+            info["profitMargins"] = fd.get("profitMargins", {}).get("raw")
+            info["returnOnAssets"] = fd.get("returnOnAssets", {}).get("raw")
+            info["debtToEquity"] = fd.get("debtToEquity", {}).get("raw")
+            info["currentRatio"] = fd.get("currentRatio", {}).get("raw")
+            info["freeCashflow"] = fd.get("freeCashflow", {}).get("raw")
+            info["recommendationKey"] = fd.get("recommendationKey")
+            info["targetMeanPrice"] = fd.get("targetMeanPrice", {}).get("raw")
+
+        # Keep at least price to be useful
+        if info.get("regularMarketPrice"):
+            return info
+        return None
+    except Exception:
+        return None
+
+
+def _fetch_sina_hk_info(code: str) -> dict | None:
+    """
+    新浪港股 API — 港股实时行情降级源
+    URL: https://hq.sinajs.cn/list=hk00700
+    """
+    import requests, re
+    # Strip .HK suffix for Sina format
+    clean = code.upper().replace(".HK", "")
+    try:
+        url = f"https://hq.sinajs.cn/list=hk{clean}"
+        resp = requests.get(url, timeout=8, headers={
+            "Referer": "https://finance.sina.com.cn",
+            "User-Agent": "Mozilla/5.0",
+        })
+        resp.encoding = "gbk"
+        text = resp.text
+        if not text or "FAILED" in text:
+            return None
+        match = re.search(r'"([^"]*)"', text)
+        if not match:
+            return None
+        fields = match.group(1).split(",")
+        if len(fields) < 10:
+            return None
+        # Sina HK fields: 0=英文名, 1=中文名, 2=今开, 3=昨收, 4=最高, 5=最低,
+        # 6=现价, 7=涨跌额, 8=涨跌幅%, 9=买价, 10=卖价, 11=成交量...
+        name = fields[1] if len(fields) > 1 else clean
+        price = _safe_float(fields[6])
+        prev_close = _safe_float(fields[3])
+        if not price:
+            return None
+        return {
+            "symbol": code,
+            "shortName": name,
+            "regularMarketPrice": price,
+            "regularMarketOpen": _safe_float(fields[2]),
+            "regularMarketDayHigh": _safe_float(fields[4]),
+            "regularMarketDayLow": _safe_float(fields[5]),
+            "regularMarketPreviousClose": prev_close,
+            "regularMarketChangePercent": _safe_float(fields[8]),
+            "regularMarketVolume": _safe_float(fields[11]),
+            "_source": "sina-hk",
+        }
+    except Exception:
+        return None
+
+
+def _is_weekend_or_holiday(market: str = "sh") -> bool:
+    """检测今天是否为非交易日（周末 + 简单节假日判断）"""
+    today = datetime.now()
+    if today.weekday() >= 5:  # Saturday=5, Sunday=6
+        return True
+    return False
+
+
 def get_us_info(ticker: str) -> dict:
     """
-    美股多源获取: Yahoo → Stooq → Yahoo直连
-    结果被磁盘缓存 5 分钟 (报价) / 1 小时 (基本面)
+    美股/港股多源获取: Yahoo → Stooq/SinaHK → Yahoo直连+v10基本面
     """
+    market = detect_market(ticker)
+
+    if market == "hk":
+        sources = [
+            ("Yahoo Finance", lambda t: _fetch_yahoo_info(t)),
+            ("Sina HK", _fetch_sina_hk_info),
+            ("Yahoo (fundamentals-direct)", lambda t: _fetch_yahoo_fundamentals_direct(t) or _fetch_yahoo_direct(t)),
+        ]
+        for name, fetcher in sources:
+            try:
+                result = fetcher(ticker)
+                if result:
+                    return result
+            except Exception:
+                continue
+        return {}
+
+    # US/Crypto
     sources = [
         ("Yahoo Finance", _fetch_yahoo_info),
         ("Stooq", _fetch_stooq_info),
+        ("Yahoo (fundamentals-direct)", _fetch_yahoo_fundamentals_direct),
         ("Yahoo (direct)", _fetch_yahoo_direct),
     ]
     for name, fetcher in sources:
-        result = fetcher(ticker)
-        if result:
-            return result
+        try:
+            result = fetcher(ticker)
+            if result:
+                return result
+        except Exception:
+            continue
     return {}
 
 
@@ -742,6 +915,11 @@ def cmd_price(ticker: str):
         print(f"❌ 无法获取 {ticker} 的数据: {err}")
         return
 
+    # 周末/休市提醒
+    market = detect_market(ticker)
+    if _is_weekend_or_holiday(market):
+        print(f"   📅 今日休市，以下为最近交易日数据")
+
     name = info.get("shortName") or info.get("longName") or ticker
     price = info.get("regularMarketPrice") or info.get("currentPrice", "N/A")
     prev_close = info.get("regularMarketPreviousClose") or info.get("previousClose")
@@ -1037,6 +1215,11 @@ def cmd_fundamentals(ticker: str):
         if not info or "error" in info:
             print(f"❌ 无法获取 {ticker} 的数据: {info.get('error', '数据为空') if info else '数据为空'}")
             return
+
+    # 周末/休市提醒
+    mkt = detect_market(ticker)
+    if _is_weekend_or_holiday(mkt):
+        print(f"   📅 今日休市，以下为最近交易日数据")
 
     name = info.get("shortName") or info.get("longName") or ticker
     source = info.get("_source", "unknown")

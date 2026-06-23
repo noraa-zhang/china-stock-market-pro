@@ -187,11 +187,48 @@ When a user asks about a stock, Claude MUST present results in the following fix
 
 ### Multi-Stock Workflow (多只股票处理流程)
 
-When a user mentions multiple stocks (e.g., "compare AAPL and MSFT", "对比一下茅台和五粮液"), Claude MUST follow this workflow:
+When a user mentions multiple stocks (e.g., "compare AAPL and MSFT", "对比一下茅台和五粮液"), Claude MUST follow this workflow.
+
+---
+
+#### Step 0: Detect Industry Context
+
+First, check if the user mentioned:
+- **Specific tickers** (e.g., "茅台", "600519", "AAPL") → Go to Step 1
+- **An industry keyword** without tickers (e.g., "白酒", "AI芯片", "新能源车") → Go to Step 1 with the industry-aware 3-option menu
+
+**Industry → Ticker Reference Table** (中国市场常见行业):
+
+| 行业关键词 | 代表股票 | 补充股票（可自定义添加） |
+|-----------|---------|----------------------|
+| 白酒 | 600519(茅台), 000858(五粮液), 000568(老窖) | 002304(洋河), 000596(古井贡), 600809(汾酒), 603369(今世缘) |
+| 新能源车 | 300750(宁德时代), 002594(比亚迪) | 601012(隆基), 300014(亿纬锂能), 300274(阳光电源) |
+| AI/芯片 | 688981(中芯国际), 002049(紫光国微) | 603986(兆易创新), 300782(卓胜微), 688256(寒武纪) |
+| 银行 | 601398(工商银行), 600036(招商银行) | 601939(建设银行), 000001(平安银行), 601166(兴业银行) |
+| 医药 | 600276(恒瑞医药), 300760(迈瑞医疗) | 000538(云南白药), 300015(爱尔眼科), 600196(复星医药) |
+| 互联网 | 00700.HK(腾讯), 09988.HK(阿里巴巴) | 03690.HK(美团), 09888.HK(百度), 09999.HK(网易) |
+| 电力/能源 | 600900(长江电力), 601088(中国神华) | 600905(三峡能源), 601857(中国石油) |
+| 消费 | 000333(美的集团), 002415(海康威视) | 600887(伊利股份), 002714(牧原股份) |
+| 证券 | 600030(中信证券), 300059(东方财富) | 601688(华泰证券), 000776(广发证券) |
+
+> 💡 上表是市场常见代表，不是投资推荐。用户提到的行业如果不在表中，Claude 应搜索或询问用户想关注哪些股票。
+
+---
 
 #### Step 1: Clarify Intent
 
-If the user's intent is ambiguous (just listed multiple tickers without saying why), ask ONE question:
+If the user mentioned an **行业关键词** (no specific tickers), present the **3-option menu**:
+
+> "这个行业有几只代表性的股票。你想：
+> 1. 📈 **对比走势** — 把它们的价格走势放在一张图上对比
+> 2. 📁 **创建投资组合** — 追踪它们的实时盈亏
+> 3. ✏️ **自定义选择** — 从行业里挑特定几只，或者加上别的股票"
+
+- **选 1 (对比)** → 直接用行业代表股票（3-4只）跑 `compare` → Go to Step 2
+- **选 2 (组合)** → Go to Step 3，组合名自动建议为行业名（如"白酒组合"）
+- **选 3 (自定义)** → 列出行业所有候选股票供用户勾选，或将用户指定的股票加入对比/组合。
+
+If the user mentioned **specific tickers** but intent is ambiguous, ask the simpler question:
 
 > "你想**对比这几只股票的走势**，还是**创建一个投资组合**来追踪它们？"
 
